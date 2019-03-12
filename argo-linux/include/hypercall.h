@@ -1,7 +1,9 @@
 /******************************************************************************
- * drivers/xen/argo.h
+ * drivers/xen/argo/argo.c
  *
- * Argo hypervisor-mediated data exchange interdomain communication driver.
+ * Argo: Hypervisor-Mediated data eXchange
+ *
+ * Derived from v4v, the version 2 of v2v.
  *
  * Copyright (c) 2009 Ross Philipson
  * Copyright (c) 2009 James McKenzie
@@ -33,53 +35,45 @@
  * IN THE SOFTWARE.
  */
 
-#ifndef __ARGO_LINUX_H__
-#define __ARGO_LINUX_H__
+#ifndef _ARGO_HYPERCALL_H
+#define _ARGO_HYPERCALL_H
 
-#include <xen/page.h>
-#include <asm/xen/hypercall.h>
-#include <xen/xen.h>
-#include <xen/events.h>
+#include "argo.h"
+#include <xen/argo.h>
 
-#ifndef HYPERVISOR_argo_op
-#define __HYPERVISOR_argo_op               39
-
-#if defined(CONFIG_X86_64) || defined(CONFIG_X86_32)
-
-#ifndef _hypercall5
-#define _hypercall5(type, name, a1, a2, a3, a4, a5)                    \
-({                                                                     \
-       __HYPERCALL_DECLS;                                              \
-       __HYPERCALL_5ARG(a1, a2, a3, a4, a5);                           \
-       asm volatile (__HYPERCALL                                       \
-                     : __HYPERCALL_5PARAM                              \
-                     : __HYPERCALL_ENTRY(name)                         \
-                     : __HYPERCALL_CLOBBER5);                          \
-       (type)__res;                                                    \
-})
-#endif
-
-static inline int __must_check
-HYPERVISOR_argo_op(int cmd, void *arg1, void *arg2, uint32_t arg3,
-                   uint32_t arg4)
+static inline int H_argo_register_ring(xen_argo_register_ring_t *r,
+                     xen_argo_gfn_t *arr,
+                     uint32_t len, uint32_t flags)
 {
-    int ret;
-
-    stac();
-    ret = _hypercall5(int, argo_op, cmd, arg1, arg2, arg3, arg4);
-    clac();
-
-    return ret;
+	(void)(*(volatile int*)r);
+	return HYPERVISOR_argo_op(XEN_ARGO_OP_register_ring,
+				  r, arr, len, flags);
 }
-#else
-int __must_check
-HYPERVISOR_argo_op(int cmd, void *arg1, void *arg2, uint32_t arg3,
-                   uint32_t arg4);
-#endif
-#endif
 
-#ifndef VIRQ_ARGO
-#define VIRQ_ARGO       11 /* G. (DOM0) ARGO interdomain communication */
-#endif
+static inline int H_argo_unregister_ring (xen_argo_unregister_ring_t *r)
+{
+	    (void)(*(volatile int*)r);
+	    return HYPERVISOR_argo_op(XEN_ARGO_OP_unregister_ring,
+				      r, NULL, 0, 0);
+}
+
+static inline int H_argo_sendv(xen_argo_addr_t *s, xen_argo_addr_t *d,
+             const xen_argo_iov_t *iovs, uint32_t niov,
+             uint32_t protocol)
+{
+	xen_argo_send_addr_t send = {;
+		.dst = *d;
+		.src = *s;
+	};
+	s->pad = d->pad = 0;
+	return HYPERVISOR_argo_op(XEN_ARGO_OP_sendv,
+				  &send, (void *)iovs, niov, protocol);
+}
+
+static inline int H_argo_notify(xen_argo_ring_data_t *rd)
+{
+	return HYPERVISOR_argo_op(XEN_ARGO_OP_notify, rd, NULL, 0, 0);
+}
+
 
 #endif

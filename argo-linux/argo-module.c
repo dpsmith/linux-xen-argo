@@ -74,6 +74,7 @@
 #endif /* XC_KERNEL */
 
 #include "argo.h"
+#include "hypercall.h"
 #include <xen/evtchn.h>
 #include <xen/argo.h>
 #include <linux/argo_dev.h>
@@ -660,44 +661,6 @@ dump_ring (struct ring *r)
   summary_ring (r);
 
   argo_hexdump (r->ring->ring, r->len);
-}
-
-/****************** hypercall ops *************************************/
-
-static int
-H_argo_register_ring(xen_argo_register_ring_t *r,
-                     xen_argo_gfn_t *arr,
-                     uint32_t len, uint32_t flags)
-{
-    (void)(*(volatile int*)r);
-    return HYPERVISOR_argo_op(XEN_ARGO_OP_register_ring, r, arr, len, flags);
-}
-
-static int
-H_argo_unregister_ring (xen_argo_unregister_ring_t *r)
-{
-    (void)(*(volatile int*)r);
-    return HYPERVISOR_argo_op(XEN_ARGO_OP_unregister_ring, r, NULL, 0, 0);
-}
-
-static int
-H_argo_sendv(xen_argo_addr_t *s, xen_argo_addr_t *d,
-             const xen_argo_iov_t *iovs, uint32_t niov,
-             uint32_t protocol)
-{
-    xen_argo_send_addr_t send;
-    send.dst = *d;
-    send.src = *s;
-    send.src.pad = 0;
-    send.dst.pad = 0;
-    return HYPERVISOR_argo_op(XEN_ARGO_OP_sendv,
-                              &send, (void *)iovs, niov, protocol);
-}
-
-static int
-H_argo_notify(xen_argo_ring_data_t *rd)
-{
-    return HYPERVISOR_argo_op(XEN_ARGO_OP_notify, rd, NULL, 0, 0);
 }
 
 /*********************port/ring uniqueness **********/
