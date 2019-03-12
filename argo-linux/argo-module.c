@@ -998,13 +998,13 @@ new_ring(struct argo_private *sponsor, struct argo_ring_id *pid)
     return ret;
 }
 
-static void
-free_ring (struct ring *r)
+void argo_free_ring (struct ring *r)
 {
     vfree(r->ring);
     argo_kfree(r->gfn_array);
     argo_kfree(r);
 }
+EXPORT_SYMBOL(argo_free_ring);
 
 /* Cleans up old rings */
 static void
@@ -1031,8 +1031,7 @@ get_ring(struct ring *r)
 }
 
 /* must be called with DEBUG_WRITELOCK; argo_write_lock */
-static int
-put_ring(struct ring *r)
+int argo_release_ring(struct ring *r)
 {
     if ( !r )
         return 0;
@@ -1044,6 +1043,7 @@ put_ring(struct ring *r)
     }
     return 0;
 }
+EXPORT_SYMBOL(argo_release_ring);
 
 /* caller must hold ring_lock */
 static struct ring *
@@ -1244,19 +1244,22 @@ xmit_queue_inline(struct argo_ring_id *from, xen_argo_addr_t *to,
     return len;
 }
 
-static void
-xmit_queue_rst_to(struct argo_ring_id *from, uint32_t conid, xen_argo_addr_t * to)
+/* Original name:
+ *   xmit_queue_rst_to(struct argo_ring_id *from, uint32_t conid, xen_argo_addr_t * to)
+ */
+static void argo_ring_reset(struct argo_ring_id *ring, uint32_t conid, xen_argo_addr_t *dst)
 {
     struct argo_stream_header sh;
 
-    if ( !to )
+    if ( !dst )
         return;
 
     sh.conid = conid;
     sh.flags = ARGO_SHF_RST;
 
-    xmit_queue_inline(from, to, &sh, sizeof(sh), ARGO_PROTO_STREAM);
+    xmit_queue_inline(ring, dst, &sh, sizeof(sh), ARGO_PROTO_STREAM);
 }
+EXPORT_SYMBOL(argo_ring_reset);
 
 /*rx*/
 
@@ -3385,576 +3388,6 @@ argo_recvfrom(struct argo_private * p, void *buf, size_t len, int flags,
 }
 
 
-/*****************************************fops ********************/
-
-static int
-argo_open_dgram(struct inode *inode, struct file *f)
-{
-    struct argo_private *p;
-
-    p = argo_kmalloc(sizeof(struct argo_private), GFP_KERNEL);
-    if ( !p )
-        return -ENOMEM;
-
-    memset(p, 0, sizeof(struct argo_private));
-    p->state = ARGO_STATE_IDLE;
-    p->desired_ring_size = DEFAULT_RING_SIZE;
-    p->r = NULL;
-    p->ptype = ARGO_PTYPE_DGRAM;
-    p->send_blocked = 0;
-
-    init_waitqueue_head(&p->readq);
-    init_waitqueue_head(&p->writeq);
-
-    argo_spin_lock_init(&p->pending_recv_lock);
-    INIT_LIST_HEAD(&p->pending_recv_list);
-    atomic_set(&p->pending_recv_count, 0);
-
-#ifdef ARGO_DEBUG
-    printk(KERN_ERR "argo_open priv %p\n", p);
-#endif
-
-    f->private_data = p;
-    f->f_flags = O_RDWR;
-
-    return 0;
-}
-
-
-static int
-argo_open_stream(struct inode *inode, struct file *f)
-{
-    struct argo_private *p;
-
-    p = argo_kmalloc(sizeof(struct argo_private), GFP_KERNEL);
-    if ( !p )
-        return -ENOMEM;
-
-    memset(p, 0, sizeof(struct argo_private));
-    p->state = ARGO_STATE_IDLE;
-    p->desired_ring_size = DEFAULT_RING_SIZE;
-    p->r = NULL;
-    p->ptype = ARGO_PTYPE_STREAM;
-    p->send_blocked = 0;
-
-    init_waitqueue_head(&p->readq);
-    init_waitqueue_head(&p->writeq);
-
-    argo_spin_lock_init(&p->pending_recv_lock);
-    INIT_LIST_HEAD(&p->pending_recv_list);
-    atomic_set(&p->pending_recv_count, 0);
-
-#ifdef ARGO_DEBUG
-    printk(KERN_ERR "argo_open priv %p\n", p);
-#endif
-
-    f->private_data = p;
-    f->f_flags = O_RDWR;
-
-    return 0;
-}
-
-
-static int
-argo_release(struct inode *inode, struct file *f)
-{
-    struct argo_private *p = (struct argo_private *) f->private_data;
-    unsigned long flags;
-    struct pending_recv *pending, *t;
-    static volatile char tmp;
-    int need_ring_free = 0;
-
-    /* XC-8841 - make sure the ring info is properly mapped so we won't efault in xen
-    * passing pointers to hypercalls.
-    * Read the first and last byte, that should repage the structure */
-    if ( p && p->r && p->r->ring )
-        tmp = *((char*)p->r->ring) + *(((char*)p->r->ring)+sizeof(xen_argo_ring_t)-1);
-
-    if ( p->ptype == ARGO_PTYPE_STREAM )
-    {
-        switch ( p->state )
-        {
-        /* EC: Assuming our process is killed while SYN is waiting in the ring 
-         *     to be consumed (accept is yet to be scheduled).
-         *     Connect will never wake up while the ring is destroy thereafter.
-         *     We reply RST to every pending SYN in that situation.
-         *     Still, the timeout handling on connect is required.
-         *     If the connecting domain is scheduled by Xen while
-         *     we're walking that list, it could possibly send another SYN by
-         *     the time we're done (very unlikely though).
-         *     This loop just speeds up the things in most cases.
-         */
-            case ARGO_STATE_LISTENING:
-            {
-                argo_spin_lock (&p->r->sponsor->pending_recv_lock);
-
-                list_for_each_entry_safe(pending, t,
-                                         &p->r->sponsor->pending_recv_list,
-                                         node)
-                {
-                    if ( pending->sh.flags & ARGO_SHF_SYN )
-                    {
-                        /* Consume the SYN */
-                        list_del(&pending->node);
-                        atomic_dec(&p->r->sponsor->pending_recv_count);
-
-                        xmit_queue_rst_to(&p->r->id, pending->sh.conid,
-                                          &pending->from);
-                        argo_kfree(pending);
-                    }
-                }
-                argo_spin_unlock(&p->r->sponsor->pending_recv_lock);
-                break;
-            }
-            case ARGO_STATE_CONNECTED:
-            case ARGO_STATE_CONNECTING:
-            case ARGO_STATE_ACCEPTED:
-            {
-                DEBUG_APPLE;
-                xmit_queue_rst_to (&p->r->id, p->conid, &p->peer);
-                break;
-            }
-            default:
-                break;
-        }
-    }
-
-    argo_write_lock_irqsave (&list_lock, flags);
-    do
-    {
-        DEBUG_APPLE;
-        if ( !p->r )
-        {
-            argo_write_unlock_irqrestore(&list_lock, flags);
-            DEBUG_APPLE;
-            break;
-        }
-        DEBUG_APPLE;
-
-        if ( p != p->r->sponsor )
-        {
-            DEBUG_APPLE;
-
-            need_ring_free = put_ring (p->r);
-            list_del(&p->node);
-            argo_write_unlock_irqrestore(&list_lock, flags);
-
-            DEBUG_APPLE;
-            break;
-        }
-        DEBUG_APPLE;
-
-        //Send RST
-
-        DEBUG_APPLE;
-        p->r->sponsor = NULL;
-        need_ring_free = put_ring(p->r);
-        argo_write_unlock_irqrestore(&list_lock, flags);
-
-        {
-            struct pending_recv *pending;
-
-            while (!list_empty (&p->pending_recv_list))
-            {
-                pending = list_first_entry(&p->pending_recv_list,
-                                           struct pending_recv,
-                                           node);
-
-                list_del(&pending->node);
-                argo_kfree(pending);
-                atomic_dec(&p->pending_recv_count);
-            }
-        }
-    }
-    while ( 0 );
-
-    if ( need_ring_free )
-        free_ring(p->r);
-
-    argo_kfree (p);
-
-    return 0;
-}
-
-static ssize_t
-argo_write(struct file *f,
-           const char __user * buf, size_t count, loff_t * ppos)
-{
-    struct argo_private *p = f->private_data;
-    int nonblock = f->f_flags & O_NONBLOCK;
-
-    return argo_sendto(p, buf, count, 0, NULL, nonblock);
-}
-
-static ssize_t
-argo_read(struct file *f, char __user * buf, size_t count, loff_t * ppos)
-{
-    struct argo_private *p = f->private_data;
-    int nonblock = f->f_flags & O_NONBLOCK;
-
-    return argo_recvfrom(p, (void *) buf, count, 0, NULL, nonblock);
-}
-
-static long
-argo_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
-{
-    // void __user *p = (void __user *) arg;
-    // int len = _IOC_SIZE (cmd);
-    int rc = -ENOTTY;
-
-    int nonblock = f->f_flags & O_NONBLOCK;
-    struct argo_private *p = f->private_data;
-
-#ifdef ARGO_DEBUG
-    printk (KERN_ERR "argo_ioctl cmd=%x pid=%d\n", cmd, current->pid);
-#endif 
-    if (_IOC_TYPE (cmd) != ARGO_TYPE)
-        return rc;
-
-    DEBUG_APPLE;
-    switch (cmd)
-    {
-        case ARGOIOCSETRINGSIZE:
-            DEBUG_APPLE;
-            {
-                uint32_t ring_size;
-                if (get_user (ring_size, (uint32_t __user *)arg))
-                    return -EFAULT;
-                rc = argo_set_ring_size (p, ring_size);
-            }
-            break;
-        case ARGOIOCBIND:
-            DEBUG_APPLE;
-            {
-                struct argo_ring_id ring_id;
-                if ( copy_from_user(&ring_id, (void __user *)arg,
-                                    sizeof(struct argo_ring_id)) )
-                    return -EFAULT;
-                DEBUG_APPLE;
-                rc = argo_bind (p, &ring_id);
-            }
-            break;
-        case ARGOIOCGETSOCKNAME:
-            if ( !access_ok (VERIFY_WRITE, arg, sizeof(struct argo_ring_id)) )
-                return -EFAULT;
-            {
-                struct argo_ring_id ring_id;
-                argo_get_sock_name(p, &ring_id);
-                if ( copy_to_user((void __user *)arg, &ring_id,
-                                  sizeof(struct argo_ring_id)) )
-                    return -EFAULT;
-            }
-            rc = 0;
-            break;
-        case ARGOIOCGETSOCKTYPE:
-            DEBUG_APPLE;
-            if ( !access_ok (VERIFY_WRITE, arg, sizeof(int)) )
-                return -EFAULT;
-            {
-                int sock_type;
-                argo_get_sock_type(p, &sock_type);
-                if ( put_user(sock_type, (int __user *)arg) )
-                    return -EFAULT;
-            }
-            rc = 0;
-            break;
-        case ARGOIOCGETPEERNAME:
-            DEBUG_APPLE;
-            if ( !access_ok (VERIFY_WRITE, arg, sizeof(xen_argo_addr_t)) )
-                return -EFAULT;
-            {
-                xen_argo_addr_t addr;
-                rc = argo_get_peer_name (p, &addr);
-                if ( rc )
-                    return rc;
-                if ( copy_to_user((void __user *)arg, &addr,
-                                  sizeof(xen_argo_addr_t)))
-                    return -EFAULT;
-            }
-            break;
-        case ARGOIOCCONNECT:
-            DEBUG_APPLE;
-            {
-                xen_argo_addr_t connect_addr;
-                if ( arg )
-                {
-                    if ( copy_from_user(&connect_addr, (void __user *)arg,
-                                        sizeof(xen_argo_addr_t)) )
-                        return -EFAULT;
-                }
-
-                //For for the lazy do a bind if it wasn't done
-                if ( p->state == ARGO_STATE_IDLE )
-                {
-                    struct argo_ring_id id;
-                    memset(&id, 0, sizeof(id));
-                    id.partner_id = XEN_ARGO_DOMID_ANY;
-                    id.domain_id = XEN_ARGO_DOMID_ANY;
-                    id.aport = 0;
-                    rc = argo_bind(p, &id);
-                    if ( rc )
-                        break;
-                }
-                if ( arg )
-                    rc = argo_connect(p, &connect_addr, nonblock);
-                else
-                    rc = argo_connect(p, NULL, nonblock);
-            }
-            break;
-        case ARGOIOCGETCONNECTERR:
-        {
-            unsigned long flags;
-            if ( !access_ok(VERIFY_WRITE, arg, sizeof(int)) )
-                return -EFAULT;
-            DEBUG_APPLE;
-
-            argo_spin_lock_irqsave (&p->pending_recv_lock, flags);
-            if ( put_user (p->pending_error, (int __user *)arg) )
-                rc = -EFAULT;
-            else
-            {
-                p->pending_error = 0;
-                rc = 0;
-            }
-            argo_spin_unlock_irqrestore (&p->pending_recv_lock, flags);
-            DEBUG_APPLE;
-        }
-        break;
-        case ARGOIOCLISTEN:
-            DEBUG_APPLE;
-            rc = argo_listen(p);
-            break;
-        case ARGOIOCACCEPT:
-            DEBUG_APPLE;
-            if ( !access_ok(VERIFY_WRITE, arg, sizeof(xen_argo_addr_t)) )
-                return -EFAULT;
-            {
-                xen_argo_addr_t addr;
-                rc = argo_accept (p, &addr, nonblock);
-                if ( rc < 0 )
-                    return rc;
-                if ( copy_to_user((void __user *)arg, &addr,
-                                  sizeof(xen_argo_addr_t)) )
-                    return -EFAULT;
-            }
-            break;
-        case ARGOIOCSEND:
-        {
-            struct argo_dev a;
-            xen_argo_addr_t addr;
-            if ( copy_from_user(&a, (void __user *)arg,
-                                sizeof(struct argo_dev)) )
-                return -EFAULT;
-
-            if ( a.addr)
-            {
-                if ( copy_from_user(&addr, (void __user *)a.addr,
-                                    sizeof(xen_argo_addr_t)) )
-                    return -EFAULT;
-                DEBUG_APPLE;
-                rc = argo_sendto(p, a.buf, a.len, a.flags, &addr, nonblock);
-            }
-            else
-            {
-                DEBUG_APPLE;
-                rc = argo_sendto(p, a.buf, a.len, a.flags, NULL, nonblock);
-            }
-        }
-        break;
-        case ARGOIOCRECV:
-        DEBUG_APPLE;
-        {
-            struct argo_dev a;
-            xen_argo_addr_t addr;
-            if ( copy_from_user(&a, (void __user *)arg, sizeof(struct argo_dev)) )
-                return -EFAULT;
-            if ( a.addr )
-            {
-                if ( copy_from_user (&addr, a.addr, sizeof(xen_argo_addr_t)) )
-                    return -EFAULT;
-                rc = argo_recvfrom (p, a.buf, a.len, a.flags, &addr, nonblock);
-                if ( rc < 0 )
-                    return rc;
-                if ( copy_to_user (a.addr, &addr, sizeof(xen_argo_addr_t)) )
-                    return -EFAULT;
-            } else
-                rc = argo_recvfrom (p, a.buf, a.len, a.flags, NULL, nonblock);
-        }
-        break;
-        default:
-            printk(KERN_ERR "unknown ioctl: cmd=%x ARGOIOCACCEPT=%lx\n", cmd,
-                   ARGOIOCACCEPT);
-            DEBUG_BANANA;
-    }
-    DEBUG_APPLE;
-#ifdef ARGO_DEBUG
-    printk (KERN_ERR "argo_ioctl cmd=%x pid=%d result=%d\n", cmd, current->pid, rc);
-#endif
-    return rc;
-}
-
-#ifdef CONFIG_COMPAT
-static long
-argo_compat_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
-{
-    int nonblock = f->f_flags & O_NONBLOCK;
-    struct argo_private *p = f->private_data;
-    int rc;
-
-    switch (cmd)
-    {
-        case ARGOIOCSEND32:
-        {
-            struct argo_dev a;
-            struct argo_dev_32 a32;
-            xen_argo_addr_t addr, *paddr = NULL;
-
-            if ( copy_from_user(&a32, (void __user *)arg, sizeof(a32)) )
-                return -EFAULT;
-
-            a.buf = compat_ptr(a32.buf);
-            a.len = a32.len;
-            a.flags = a32.flags;
-            a.addr = compat_ptr(a32.addr);
-
-            if ( a.addr )
-            {
-                if ( copy_from_user(&addr, (void __user *)a.addr,
-                                    sizeof(xen_argo_addr_t)) )
-                    return -EFAULT;
-                paddr = &addr;
-                DEBUG_APPLE;
-            }
-
-            rc = argo_sendto (p, a.buf, a.len, a.flags, paddr, nonblock);
-        }
-        break;
-
-        case ARGOIOCRECV32:
-        DEBUG_APPLE;
-        {
-            struct argo_dev_32 a32;
-            struct argo_dev a;
-            xen_argo_addr_t addr;
-
-            if ( copy_from_user(&a32, (void __user *)arg, sizeof(a32)) )
-                return -EFAULT;
-
-            a.buf = compat_ptr(a32.buf);
-            a.len = a32.len;
-            a.flags = a32.flags;
-            a.addr = compat_ptr(a32.addr);
-
-            if ( a.addr )
-            {
-                if ( copy_from_user (&addr, a.addr, sizeof(xen_argo_addr_t)) )
-                    return -EFAULT;
-                rc = argo_recvfrom(p, a.buf, a.len, a.flags, &addr, nonblock);
-                if (rc < 0)
-                    return rc;
-                if (copy_to_user(a.addr, &addr, sizeof(xen_argo_addr_t)))
-                    return -EFAULT;
-            } else
-                rc = argo_recvfrom(p, a.buf, a.len, a.flags, NULL, nonblock);
-        }
-        break;
-        default:
-            rc = argo_ioctl(f, cmd, (unsigned long)compat_ptr(arg));
-    }
-
-    return rc;
-}
-#endif
-
-static unsigned int
-argo_poll(struct file *f, poll_table * pt)
-{
-//FIXME
-    unsigned int mask = 0;
-    struct argo_private *p = f->private_data;
-    argo_read_lock(&list_lock);
-
-    switch (p->ptype)
-    {
-        case ARGO_PTYPE_DGRAM:
-            switch (p->state)
-            {
-                case ARGO_STATE_CONNECTED:
-                    //FIXME: maybe do something smart here
-                case ARGO_STATE_BOUND:
-                    poll_wait(f, &p->readq, pt);
-                    mask |= POLLOUT | POLLWRNORM;
-                    if ( p->r->ring->tx_ptr != p->r->ring->rx_ptr )
-                        mask |= POLLIN | POLLRDNORM;
-                    break;
-                default:
-                    break;
-            }
-            break;
-
-        case ARGO_PTYPE_STREAM:
-            switch (p->state)
-            {
-                case ARGO_STATE_BOUND:
-                    break;
-                case ARGO_STATE_LISTENING:
-                    poll_wait(f, &p->readq, pt);
-                    if (!list_empty(&p->pending_recv_list))
-                        mask |= POLLIN | POLLRDNORM;
-                    break;
-                case ARGO_STATE_ACCEPTED:
-                case ARGO_STATE_CONNECTED:
-                    poll_wait(f, &p->readq, pt);
-                    poll_wait(f, &p->writeq, pt);
-                    if ( !p->send_blocked )
-                        mask |= POLLOUT | POLLWRNORM;
-                    if ( !list_empty(&p->pending_recv_list) )
-                        mask |= POLLIN | POLLRDNORM;
-                    break;
-                case ARGO_STATE_CONNECTING:
-                    poll_wait(f, &p->writeq, pt);
-                    break;
-                case ARGO_STATE_DISCONNECTED:
-                    mask |= POLLOUT | POLLWRNORM;
-                    mask |= POLLIN | POLLRDNORM;
-                    break;
-                case ARGO_STATE_IDLE:
-                    break;
-            }
-            break;
-    }
-
-    argo_read_unlock(&list_lock);
-    return mask;
-}
-
-static const struct file_operations argo_fops_stream = {
-    .owner = THIS_MODULE,
-    .write = argo_write,
-    .read = argo_read,
-    .unlocked_ioctl = argo_ioctl,
-#ifdef CONFIG_COMPAT
-    .compat_ioctl = argo_compat_ioctl,
-#endif
-    .open = argo_open_stream,
-    .release = argo_release,
-    .poll = argo_poll,
-};
-
-
-static const struct file_operations argo_fops_dgram = {
-    .owner = THIS_MODULE,
-    .write = argo_write,
-    .read = argo_read,
-    .unlocked_ioctl = argo_ioctl,
-#ifdef CONFIG_COMPAT
-    .compat_ioctl = argo_compat_ioctl,
-#endif
-    .open = argo_open_dgram,
-    .release = argo_release,
-    .poll = argo_poll,
-};
-
 /********************************xen virq goo ***************************/
 static int argo_irq = -1;
 
@@ -4027,18 +3460,6 @@ bind_signal(void)
 
 /************************** argo device ****************************************/
 
-static struct miscdevice argo_miscdev_dgram = {
-    .minor = MISC_DYNAMIC_MINOR,
-    .name = "argo_dgram",
-    .fops = &argo_fops_dgram,
-};
-
-static struct miscdevice argo_miscdev_stream = {
-    .minor = MISC_DYNAMIC_MINOR,
-    .name = "argo_stream",
-    .fops = &argo_fops_stream,
-};
-
 static int
 argo_suspend(struct platform_device *dev, pm_message_t state)
 {
@@ -4108,22 +3529,6 @@ argo_probe(struct platform_device *dev)
         return -ENODEV;
     }
 
-    err = misc_register(&argo_miscdev_dgram);
-    if ( err )
-    {
-        printk(KERN_ERR "Could not register /dev/argo_dgram\n");
-        unsetup_fs();
-        return err;
-    }
-
-    err = misc_register (&argo_miscdev_stream);
-    if ( err )
-    {
-        printk(KERN_ERR "Could not register /dev/argo_stream\n");
-        unsetup_fs();
-        return err;
-    }
-
     printk (KERN_INFO "Xen ARGO device installed.\n");
     return 0;
 }
@@ -4137,8 +3542,6 @@ __devexit
 argo_remove(struct platform_device *dev)
 {
     unbind_signal();
-    misc_deregister(&argo_miscdev_dgram);
-    misc_deregister(&argo_miscdev_stream);
     unsetup_fs();
     return 0;
 }
